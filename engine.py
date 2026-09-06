@@ -21,13 +21,17 @@ from sr_model import RRDBNet, tile_sr_inference
 ROOT = Path(__file__).resolve().parent
 
 DETAIL_PROMPT = (
-    '8k uhd photograph, extreme close-up macro texture, visible skin pores, fine facial peach fuzz, '
-    'individual hair strands, crisp eyelashes, detailed eyebrows, intricate iris pattern, lip texture, '
-    'fine cloth weave, fabric fibers, natural surface texture, tack sharp focus, photorealistic 35mm photograph'
+    'masterpiece 8k uhd hyperrealistic 35mm photograph, tack sharp focus, authentic human skin texture, '
+    'visible fine skin pores, natural cellular skin relief, delicate facial peach fuzz, subtle fine expression lines, '
+    'realistic skin micro-irregularities and uneven microscopic texture, subtle tonal variation, '
+    'individual hair strands, crisp eyelashes and eyebrow hairs, sharp iris limbal ring, intricate iris stroma, '
+    'natural lip vermilion creases, authentic textile weave, individual cloth fibers, crisp stitching, '
+    'material-specific realistic surfaces, cinematic directional lighting, RAW photo quality'
 )
 NEGATIVE_PROMPT = (
-    'blur, smooth, airbrushed, plastic, cartoon, painting, drawing, lowres, over-smoothed, '
-    'soft skin, flat texture, watercolor, artifacts, distorted, out of focus'
+    'smooth, airbrushed, plastic doll skin, waxy complexion, porcelain skin, blurred, filtered, '
+    'denoised, flat shading, cartoon, illustration, painting, drawing, lowres, soft focus, out of focus, '
+    'over-smoothed, artificial skin, makeup blur, muddy textures, artifacts'
 )
 
 
@@ -98,11 +102,45 @@ def clarity_gpu(original, strength):
     return (original + (delta * strength)).clamp(0, 1)
 
 
+def detect_material_masks(base_tensor):
+    """Detect material zones using colorimetry and local gradient statistics on GPU.
+    Returns:
+      skin_mask: [0, 1] soft mask for human skin tones
+      edge_mask: [0, 1] soft mask for sharp high-contrast structural edges/hair/eyes
+    """
+    import torch
+    import torch.nn.functional as F
+
+    r, g, b = base_tensor[:, 0:1], base_tensor[:, 1:2], base_tensor[:, 2:3]
+    # Skin tone detection in normalized RGB space:
+    # Typical skin: R > G > B, (R - G) > 0.03, (R + G + B) in realistic skin range
+    skin_cond1 = (r > g) & (g > b)
+    skin_cond2 = (r - g > 0.02) & (r - b > 0.04)
+    skin_cond3 = (r > 0.15) & (r < 0.95) & (b < 0.82)
+    raw_skin = (skin_cond1 & skin_cond2 & skin_cond3).float()
+
+    # Smooth the skin mask to create organic, gradual transitions
+    skin_mask = smooth_gpu(raw_skin, passes=3)
+
+    # Detect high-contrast edges (hair strands, eyebrows, eyelashes, iris boundary, textile edges)
+    lum = (base_tensor * base_tensor.new_tensor([0.2126, 0.7152, 0.0722]).view(1, 3, 1, 1)).sum(1, keepdim=True)
+    kx = base_tensor.new_tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).view(1, 1, 3, 3) / 8.0
+    ky = base_tensor.new_tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]).view(1, 1, 3, 3) / 8.0
+    gx = F.conv2d(F.pad(lum, (1, 1, 1, 1), mode='replicate'), kx)
+    gy = F.conv2d(F.pad(lum, (1, 1, 1, 1), mode='replicate'), ky)
+    grad = torch.sqrt(gx * gx + gy * gy)
+    edge_mask = (grad * 12.0).clamp(0, 1)
+
+    return skin_mask.clamp(0, 1), edge_mask.clamp(0, 1)
+
+
 def structure_preserving_blend(base_reference, enhanced_texture, amount=1.0):
-    """Structure-preserving frequency blend.
-    Strictly preserves identity, macro face geometry, lighting, and color from base_reference,
-    while transferring legitimate high-frequency photographic texture (pores, hairs, fabric weave)
-    from enhanced_texture without destructive clamping or washing out.
+    """Material-aware structure-preserving frequency blend.
+    Strictly preserves identity, macro face geometry, lighting, and global color,
+    while transferring material-tailored photographic texture:
+      - Skin: receives genuine fine pores, cellular relief, subtle tonal variation, and peach fuzz
+      - Hair/Eyes: preserves crisp strand sharpness without harsh over-accentuation
+      - Clothing/Surfaces: authentic fabric fibers, weave, and appropriate physical texture
     """
     import torch
     import torch.nn.functional as F
@@ -110,32 +148,47 @@ def structure_preserving_blend(base_reference, enhanced_texture, amount=1.0):
     def luminance(t):
         return (t * t.new_tensor([0.2126, 0.7152, 0.0722]).view(1, 3, 1, 1)).sum(1, keepdim=True)
 
-    # 1. Separate macro structure from micro texture using smooth_gpu
+    # 1. Multi-scale frequency separation
+    # base_low: macro geometry, lighting, and expression
     base_low = smooth_gpu(base_reference, passes=2)
     enh_low = smooth_gpu(enhanced_texture, passes=2)
 
-    # 2. Extract high-frequency residuals (pores, hairs, weave)
+    # High frequencies (pores, hairs, cloth weave, fine micro-relief)
     base_high = base_reference - base_low
     enh_high = enhanced_texture - enh_low
 
-    # 3. Macro consistency check: safeguard against spatial drift or hallucinated objects
+    # 2. Material-aware spatial guidance masks
+    skin_mask, edge_mask = detect_material_masks(base_reference)
+
+    # 3. Macro consistency check: safeguard against spatial drift or hallucinated structures
     diff_lum = luminance(enh_low - base_low).abs()
-    # Confidence mask: 1.0 where base geometry matches, gently tapering if major distortions occur
     confidence = torch.exp(-diff_lum * 6.0)
 
-    # 4. Transfer high frequencies scaled by amount and confidence
-    novel_high = (enh_high - base_high) * confidence
-    blended_high = base_high + novel_high * amount
+    # 4. Material-adaptive modulation:
+    # Hair and high-contrast lines already have strong gradient energy; don't over-sharpen them.
+    # Skin has lower natural gradient energy and needs full pore/micro-relief transfer + subtle micro-tonal variation.
+    # Weave and textiles naturally occupy mid-to-high frequencies with moderate edge energy.
+    material_gain = 1.0 + (skin_mask * 0.45) - (edge_mask * 0.20)
+    material_gain = material_gain.clamp(0.6, 1.5)
 
-    # 5. Recombine: strictly anchor to base_low (preserves 100% identity, geometry, and color)
+    novel_high = (enh_high - base_high) * confidence
+    blended_high = base_high + novel_high * (amount * material_gain)
+
+    # 5. Extract natural micro-tonal variation on skin (subtle cellular relief & microscopic unevenness)
+    # This prevents skin from looking artificially waxy or flat beneath the pores
+    enh_mid = smooth_gpu(enhanced_texture, passes=1) - enh_low
+    base_mid = smooth_gpu(base_reference, passes=1) - base_low
+    novel_mid = (enh_mid - base_mid) * confidence * skin_mask * 0.35 * amount
+    blended_high = blended_high + novel_mid
+
+    # 6. Recombine: strictly anchor to base_low (preserves 100% identity, geometry, and color)
     result = base_low + blended_high
 
-    # 6. Guard global color balance: match luminance delta while keeping base chrominance intact
+    # 7. Guard global color balance: match luminance delta while keeping base chrominance intact
     result_lum = luminance(result)
     base_lum = luminance(base_reference)
     lum_delta = result_lum - base_lum
 
-    # Final combined image anchored to base RGB + transferred luminance detail
     final_output = base_reference + (result - base_reference) * 0.85 + lum_delta * 0.15
     return final_output.clamp(0, 1)
 
@@ -338,30 +391,53 @@ class DetailEngine:
                             self.prompt_cache = (prompt, encode_full_prompt(pipe, prompt))
                         pos_emb, neg_emb, actual_prompt = self.prompt_cache[1]
 
-                        # Working resolution for diffusion refinement (768px edge gives sharp detail without tile explosion)
-                        edge = 768
+                        # Working resolution for diffusion refinement (optimized for GTX 1660 Ti speed: 640px edge)
+                        edge = 640
                         dw, dh = working_size((target_w, target_h), edge)
                         diff_input = F.interpolate(sr_canvas, size=(dh, dw), mode='bilinear', align_corners=False)
 
-                        tiled = (dh > 600 or dw > 600)
-                        tiles = [(x, y) for y in tile_starts(dh, tile=512, overlap=96) for x in tile_starts(dw, tile=512, overlap=96)] if tiled else [(0, 0)]
+                        # Detect material masks at working resolution to filter out uninformative tiles (e.g. flat background)
+                        work_skin_mask, work_edge_mask = detect_material_masks(diff_input)
+                        detail_energy_map = (work_skin_mask + work_edge_mask).clamp(0, 1)
+
+                        # Efficient 576px tiles with 48px overlap
+                        tile_dim = 576
+                        overlap_dim = 48
+                        tiled = (dh > tile_dim or dw > tile_dim)
+                        all_tiles = [(x, y) for y in tile_starts(dh, tile=tile_dim, overlap=overlap_dim) for x in tile_starts(dw, tile=tile_dim, overlap=overlap_dim)] if tiled else [(0, 0)]
+
+                        # Filter tiles: prioritize tiles that contain skin, facial features, hair, eyes, or clothing textures
+                        active_tiles = []
+                        for x, y in all_tiles:
+                            th = min(tile_dim, dh - y)
+                            tw = min(tile_dim, dw - x)
+                            tile_score = detail_energy_map[:, :, y:y+th, x:x+tw].mean().item()
+                            # If image has multiple tiles, skip pure featureless background tiles
+                            if len(all_tiles) > 1 and tile_score < 0.04:
+                                continue
+                            active_tiles.append((x, y))
+
+                        if not active_tiles:
+                            active_tiles = [(0, 0)]
+
                         diff_output = torch.zeros_like(diff_input)
                         diff_weights = torch.zeros_like(diff_input[:, :1])
                         shared_noise = torch.randn((1, 4, math.ceil(dh/8), math.ceil(dw/8)), device='cuda',
                                                    generator=torch.Generator(device='cuda').manual_seed(seed))
 
-                        total_steps = 14
-                        num_steps = math.ceil(total_steps * max(0.15, creativity))
-                        guidance_scale = 4.0
+                        # 10 DPMSolver steps with small creativity yields 2-4 fast denoising steps (~3-4x faster per tile)
+                        total_steps = 10
+                        num_steps = math.ceil(total_steps * max(0.12, min(0.35, creativity)))
+                        guidance_scale = 3.5
 
                         diff_start_p = 0.52
                         diff_end_p = 0.85
 
-                        report(f'Generating micro-detail texture ({len(tiles)} section(s), {num_steps} steps)…', diff_start_p)
-                        for tile_idx, (x, y) in enumerate(tiles):
+                        report(f'Generating micro-detail texture ({len(active_tiles)} section(s), {num_steps} steps)…', diff_start_p)
+                        for tile_idx, (x, y) in enumerate(active_tiles):
                             check()
-                            th = 512 if tiled else dh
-                            tw = 512 if tiled else dw
+                            th = min(tile_dim, dh - y)
+                            tw = min(tile_dim, dw - x)
                             patch = diff_input[:, :, y:y+th, x:x+tw]
                             ph, pw = patch.shape[-2:]
                             padded = F.pad(patch, (0, (-pw) % 8, 0, (-ph) % 8), mode='replicate')
@@ -369,14 +445,14 @@ class DetailEngine:
 
                             def step_cb(_p, step, _ts, kwargs):
                                 check()
-                                step_frac = (tile_idx + (step + 1) / num_steps) / len(tiles)
+                                step_frac = (tile_idx + (step + 1) / num_steps) / len(active_tiles)
                                 curr_p = diff_start_p + (diff_end_p - diff_start_p) * step_frac
-                                report(f'Micro-detail section {tile_idx+1}/{len(tiles)} · step {step+1}/{num_steps}', curr_p)
+                                report(f'Micro-detail section {tile_idx+1}/{len(active_tiles)} · step {step+1}/{num_steps}', curr_p)
                                 return kwargs
 
                             gen_patch = pipe(
                                 prompt_embeds=pos_emb, negative_prompt_embeds=neg_emb,
-                                image=padded, strength=creativity, num_inference_steps=total_steps,
+                                image=padded, strength=min(0.35, creativity), num_inference_steps=total_steps,
                                 guidance_scale=guidance_scale, generator=torch.Generator(device='cuda').manual_seed(seed),
                                 output_type='pt', callback_on_step_end=step_cb,
                             ).images[:, :, :ph, :pw]
@@ -389,14 +465,19 @@ class DetailEngine:
                             diff_output[:, :, y:y+ph, x:x+pw] += gen_patch * wgt
                             diff_weights[:, :, y:y+ph, x:x+pw] += wgt
 
-                        diff_output /= diff_weights.clamp_min(1e-8)
+                        # Blend diff_output with diff_input where weights exist, keep original diff_input elsewhere
+                        has_weight = (diff_weights > 1e-6)
+                        diff_output = torch.where(has_weight, diff_output / diff_weights.clamp_min(1e-8), diff_input)
                         diff_upscaled = F.interpolate(diff_output, size=(target_h, target_w), mode='bilinear', align_corners=False)
 
                         # Extract high-frequency generative detail and transfer onto the super-resolved canvas
                         report('Transferring micro-detail textures…', 0.86)
                         diff_high = diff_upscaled - smooth_gpu(diff_upscaled, passes=1)
-                        # Inject novel generative pores, fine hairs, and weave directly onto SR canvas
-                        sr_canvas = (sr_canvas + diff_high * (amount * 0.9)).clamp(0, 1)
+                        # Material-adaptive injection: skin receives enhanced micro-relief & pores
+                        # while hair keeps its current strand quality without harsh over-accentuation
+                        skin_mask_inj, edge_mask_inj = detect_material_masks(sr_canvas)
+                        diff_gain = 1.0 + (skin_mask_inj * 0.40) - (edge_mask_inj * 0.15)
+                        sr_canvas = (sr_canvas + diff_high * (amount * 0.9 * diff_gain.clamp(0.7, 1.4))).clamp(0, 1)
 
                     # STAGE 3: Final structure-preserving blend & micro-contrast
                     check()
