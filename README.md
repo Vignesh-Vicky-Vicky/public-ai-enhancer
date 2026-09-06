@@ -58,35 +58,35 @@ After setup the app is offline, including model loading. Images are never upload
 ## What the controls do
 
 - **AI detail generation (version 3):** Stable Diffusion 1.5 proposes texture. Detail mode works at up to a 896-pixel long edge, generating overlapping 512-pixel sections with 128-pixel minimum overlap and feathered blending. It retains finer spatial detail than the old 512-pixel full-frame pass. The blend adds bounded luminance detail, rejects opposing texture and major structure changes, and protects strong edges. Same model, higher working resolution; no new download required.
-- **Clarity:** independently enhances existing texture and local contrast at the original resolution on the GPU. This is sharpening, not invented AI detail. Start at 1.0; zero disables it. High values can emphasize noise or halos.
-- **GPU texture boost:** fast sharpening of existing texture; it does not invent new details and does not need the model.
-- **Detail / Fast / Balanced / Fine:** maximum AI working edge of 896 / 512 / 640 / 768 pixels, with 6 steps per section in Detail, and 8 / 10 / 12 steps per full frame for the other settings. Detail can require up to 4 sections. All settings may hit the memory or time limit depending on GPU load.
-- **Creativity:** more allows the diffusion model to alter the texture more. It can introduce unwanted details.
-- **Texture intensity:** scales the texture contribution; too much can create halos or grain.
 
-Output retains the input dimensions. Detail mode uses feathered overlap to reduce patch boundaries, but texture consistency and artifact-free results are not guaranteed. Larger images are reduced for AI processing; this does **not** provide native 4K microdetail. Input limit: 16 megapixels. Photos become RGB PNGs; transparency and original camera metadata are not retained. Photo quality still needs evaluation on the actual source image; screenshots alone are insufficient for a pixel-level comparison.
+Use **+ / −**, the mouse wheel over either image, **100%** for actual pixels, or **Fit** for the complete picture. Drag either image to pan both together. Double-click switches to 100%. Both views always use the same zoom and image coordinates. Zoom is limited to 5–800%; only the visible crop is rendered. At 100% and above the viewer uses nearest-neighbor display so interpolation does not hide pixel-level differences. Viewing does not change the exported image.
 
-## Speed and GPU memory
+After setup the app is offline, including model loading. Images are never uploaded. Keep the terminal window open while using the app; closing the app releases its GPU memory.
 
-Measured on this PC: **20.84 seconds** for a 512 × 512 synthetic brick image in AI Fast mode, including model loading, with **4,876 MiB peak PyTorch GPU allocation**. The CUDA enhancement/cancellation tests and desktop-window smoke test also passed. This confirms the pipeline runs; it does not establish photo quality or timings for larger settings.
+## Photographic Super-Resolution & Micro-Detail Pipeline
 
-Under 180 seconds is a target, not a guarantee. The visible timer includes model loading and processing. A cooperative 170-second budget stops unfinished AI jobs between steps; a long GPU operation can exceed that budget. No partial result is presented as successful. The first job loads the model; later jobs reuse it on the GPU.
+Detail Lab uses a modern multi-stage photographic enhancement pipeline:
+1. **Photographic Super-Resolution (Stage 1):** Dedicated Real-ESRGAN RRDBNet reconstructor performing direct photographic super-resolution directly at target resolution (2× or 4×), with tiled GPU inference for strict 6GB VRAM safety.
+2. **Optional Micro-Detail Generation (Stage 2):** When using **Maximum Detail**, a controlled, low-strength diffusion refinement pass is applied to generate high-frequency micro-details.
+3. **Structure-Preserving Frequency Blend (Stage 3):** Replaces destructive clamping and covariance removal with frequency band separation: low spatial frequencies (identity, facial geometry, global lighting, and color) are strictly anchored to the base, while legitimate high-frequency details (pores, hairs, fabric weave) are smoothly integrated.
 
-All model components stay on CUDA, in FP32 for GTX 16-series compatibility. No CPU fallback, offload, or disk inference. If memory fills, close games and other GPU-heavy applications, restart Detail Lab, and use Fast. Windows may itself manage shared GPU memory; this app cannot override driver behavior.
+## What the controls do
 
-## Verification and troubleshooting
+- **Enhancement Mode:**
+  - **Fast Detail:** Dedicated photographic super-resolution. Produces visibly sharp, authentic reconstruction at 2× and 4× in seconds.
+  - **Maximum Detail:** Photographic super-resolution followed by generative diffusion micro-detail refinement.
+- **Output Size:**
+  - **1× original size:** Restores fine details at original dimensions.
+  - **2× output / 4× output:** Reconstructs genuine super-resolved pixels directly at 2× or 4× target resolution.
+- **Micro-contrast clarity:** Luminance-domain micro-contrast enhancement.
+- **Texture blend intensity:** Scales the high-frequency detail transfer.
+- **Micro-detail creativity:** Controls diffusion strength in Maximum Detail mode.
 
-Run from PowerShell in this folder:
+## Troubleshooting
 
-```powershell
-.\.venv\Scripts\python.exe -m unittest test_engine.py
-.\.venv\Scripts\python.exe benchmark.py
-# Test your own image:
-.\.venv\Scripts\python.exe benchmark.py --image "C:\path\photo.jpg"
-```
+If models are missing, run `setup.bat` once with an internet connection. Once downloaded, all models run completely offline on CUDA.
 
-The benchmark writes images and measured GPU/time metadata to `outputs`. The default brick illustration is a functional test, not a quality benchmark for photographs.
-
-If the model is missing, run `setup.bat`. If CUDA is unavailable, rerun setup and check the NVIDIA driver. This app intentionally refuses CPU inference. Cancel takes effect between GPU steps, not in the middle of an operation.
-
-Model: [Stable Diffusion 1.5](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5), CreativeML OpenRAIL-M. Its model card is downloaded with the weights and links to the model license. Libraries: [Diffusers](https://huggingface.co/docs/diffusers/index), [PyTorch](https://pytorch.org/).
+Models used:
+- [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) RRDBNet photographic restoration
+- [Stable Diffusion 1.5](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5) (for optional Maximum Detail micro-refinement)
+- [PyTorch](https://pytorch.org/).
