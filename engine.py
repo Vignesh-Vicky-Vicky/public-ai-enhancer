@@ -1,6 +1,6 @@
 """GPU photographic restoration and micro-detail engine.
 Stage 1: Dedicated Real-ESRGAN super-resolution/restoration directly at target resolution (1x, 2x, 4x).
-Stage 2 (Optional): Low-strength generative diffusion micro-detail refinement.
+Stage 2 (Optional): High-frequency diffusion micro-detail generator (pores, fine hairs, iris detail, fabric weave).
 Stage 3: Structure-preserving frequency blend anchoring identity and geometry while transferring rich high-frequency textures.
 """
 import os
@@ -18,14 +18,22 @@ from PIL import Image
 from sr_model import RRDBNet, tile_sr_inference
 
 ROOT = Path(__file__).resolve().parent
-DETAIL_PROMPT = '''Upscale the entire image with strong, natural micro-detail enhancement everywhere. Recover realistic skin pores, tiny facial hairs, fine lines, subtle skin texture, individual hair strands, eyelashes, eyebrows, iris detail, lip texture, and small facial features. Reveal dense fabric detail in all clothing, including weave, fibers, stitching, seams, folds, wrinkles, and surface texture. Enhance fine detail in the background and every visible object as well. Keep the original person, face, expression, proportions, pose, clothing, colors, lighting, and composition unchanged. The result should look like a genuinely higher-resolution version of the same photo, not a redesigned or beautified image. Avoid plastic skin, oversharpening, fake patterns, invented objects, altered facial features, or artificial-looking texture.'''
-NEGATIVE_PROMPT = 'plastic skin, airbrushed, beauty filter, smooth skin, fake texture, repeating patterns, oversharpened, halos, altered face, altered expression, distorted anatomy, extra objects, changed clothing, changed colors, blurry, text, watermark'
+
+DETAIL_PROMPT = (
+    '8k uhd photograph, extreme close-up macro texture, visible skin pores, fine facial peach fuzz, '
+    'individual hair strands, crisp eyelashes, detailed eyebrows, intricate iris pattern, lip texture, '
+    'fine cloth weave, fabric fibers, natural surface texture, tack sharp focus, photorealistic 35mm photograph'
+)
+NEGATIVE_PROMPT = (
+    'blur, smooth, airbrushed, plastic, cartoon, painting, drawing, lowres, over-smoothed, '
+    'soft skin, flat texture, watercolor, artifacts, distorted, out of focus'
+)
 
 
 def encode_full_prompt(pipe, guidance):
     """Encode prompt chunks to prevent truncation beyond 77 tokens."""
     import torch
-    positive = DETAIL_PROMPT + '\nPrioritize identity and structural consistency over aggressive detail generation. Preserve the original face, expression, clothing design, proportions, lighting and composition.' + ('\nAdditional image guidance: ' + guidance.strip() if guidance.strip() and guidance.strip() != DETAIL_PROMPT else '')
+    positive = DETAIL_PROMPT + ('\nAdditional details: ' + guidance.strip() if guidance.strip() and guidance.strip() != DETAIL_PROMPT else '')
     negative = NEGATIVE_PROMPT
     tokenizer = pipe.tokenizer
     capacity = tokenizer.model_max_length - 2
@@ -45,45 +53,55 @@ def encode_full_prompt(pipe, guidance):
 
 
 PRESETS = {'Detail · 896': (896, 6), 'Fast · 512': (512, 8), 'Balanced · 640': (640, 10), 'Fine · 768': (768, 12)}
-# Modes: Fast Detail (Pure SR/Restoration, lightning fast), Maximum Detail (SR + Diffusion micro-detail pass)
-EFFICIENT_MODES = {'Fast Detail': (0, 0, 0.0), 'Maximum Detail': (768, 5, 2.5)}
+EFFICIENT_MODES = {'Fast Detail': (0, 0, 0.0), 'Maximum Detail': (768, 8, 4.0)}
 
 
-def tile_starts(length, tile=512, overlap=128):
+def tile_starts(length, tile=512, overlap=96):
     if length <= tile:
         return [0]
-    return sorted(set(list(range(0, length - tile + 1, tile - overlap)) + [math.ceil((length - tile) / 8) * 8]))
+    step = tile - overlap
+    starts = list(range(0, length - tile + 1, step))
+    if starts[-1] != length - tile:
+        starts.append(length - tile)
+    return sorted(set(starts))
 
 
 class Cancelled(RuntimeError):
     pass
 
 
-def smooth_gpu(t):
+def smooth_gpu(t, passes=1):
+    """Gaussian smoothing kernel for frequency separation."""
     import torch
     import torch.nn.functional as F
-    kernel = torch.tensor([1, 4, 6, 4, 1], device=t.device, dtype=t.dtype) / 16
-    t = F.conv2d(F.pad(t, (2, 2, 0, 0), mode='replicate'), kernel.view(1, 1, 1, 5).expand(3, 1, 1, 5), groups=3)
-    return F.conv2d(F.pad(t, (0, 0, 2, 2), mode='replicate'), kernel.view(1, 1, 5, 1).expand(3, 1, 5, 1), groups=3)
+    kernel = torch.tensor([1, 4, 6, 4, 1], device=t.device, dtype=t.dtype) / 16.0
+    k_h = kernel.view(1, 1, 1, 5).expand(3, 1, 1, 5)
+    k_v = kernel.view(1, 1, 5, 1).expand(3, 1, 5, 1)
+    out = t
+    for _ in range(passes):
+        out = F.conv2d(F.pad(out, (2, 2, 0, 0), mode='replicate'), k_h, groups=3)
+        out = F.conv2d(F.pad(out, (0, 0, 2, 2), mode='replicate'), k_v, groups=3)
+    return out
 
 
 def clarity_gpu(original, strength):
-    """High-frequency luminance clarity enhancing existing micro-detail cleanly."""
+    """Luminance micro-contrast clarity enhancing fine high frequencies."""
     if strength <= 0:
         return original
     import torch
-    base = smooth_gpu(original)
+    base = smooth_gpu(original, passes=1)
     fine = original - base
-    medium = base - smooth_gpu(smooth_gpu(base))
-    delta = (fine * 0.85 + medium * 0.5).mean(1, keepdim=True)
+    medium = base - smooth_gpu(base, passes=2)
+    delta = (fine * 1.0 + medium * 0.5).mean(1, keepdim=True)
     delta = torch.sign(delta) * (delta.abs() - 0.001).clamp(min=0)
-    return original + (delta * strength).clamp(-0.08, 0.08)
+    return (original + (delta * strength)).clamp(0, 1)
 
 
 def structure_preserving_blend(base_reference, enhanced_texture, amount=1.0):
-    """Conservative structure-preserving frequency blend.
-    Preserves identity, face geometry, lighting, and low-frequency colors strictly from base_reference,
-    while injecting genuine photographic micro-detail (pores, hairs, fabric weave) from enhanced_texture.
+    """Structure-preserving frequency blend.
+    Strictly preserves identity, macro face geometry, lighting, and color from base_reference,
+    while transferring legitimate high-frequency photographic texture (pores, hairs, fabric weave)
+    from enhanced_texture without destructive clamping or washing out.
     """
     import torch
     import torch.nn.functional as F
@@ -91,38 +109,38 @@ def structure_preserving_blend(base_reference, enhanced_texture, amount=1.0):
     def luminance(t):
         return (t * t.new_tensor([0.2126, 0.7152, 0.0722]).view(1, 3, 1, 1)).sum(1, keepdim=True)
 
-    # Low-pass filter to extract macro structure, identity, and lighting
-    base_low = smooth_gpu(smooth_gpu(base_reference))
-    enh_low = smooth_gpu(smooth_gpu(enhanced_texture))
+    # 1. Separate macro structure from micro texture using smooth_gpu
+    base_low = smooth_gpu(base_reference, passes=2)
+    enh_low = smooth_gpu(enhanced_texture, passes=2)
 
-    # High-frequency residual from enhanced source (contains pores, fine lines, fabric fibers)
-    enh_high = enhanced_texture - enh_low
+    # 2. Extract high-frequency residuals (pores, hairs, weave)
     base_high = base_reference - base_low
+    enh_high = enhanced_texture - enh_low
 
-    # Structural difference check: prevent structural shifts or ghosting
+    # 3. Macro consistency check: safeguard against spatial drift or hallucinated objects
     diff_lum = luminance(enh_low - base_low).abs()
-    # Confidence mask: 1 where macro structure matches closely, tapering where hallucinated shifts occur
-    confidence = torch.exp(-diff_lum * 10.0)
+    # Confidence mask: 1.0 where base geometry matches, gently tapering if major distortions occur
+    confidence = torch.exp(-diff_lum * 6.0)
 
-    # Blend high-frequency components:
-    # Blend base high frequency with enhanced high frequency scaled by amount
+    # 4. Transfer high frequencies
+    # Transfer the high-frequency difference scaled by amount and confidence
     novel_high = (enh_high - base_high) * confidence
-    transfer = base_high + novel_high * amount
+    blended_high = base_high + novel_high * amount
 
-    # Combine strict base low-frequency structure with transferred high-frequency details
-    result = base_low + transfer
+    # 5. Recombine: strictly anchor to base_low (preserves 100% identity, geometry, and color)
+    result = base_low + blended_high
 
-    # Prevent chromatic aberration or color drift by keeping color channels anchored to base
+    # 6. Guard global color balance: match luminance delta while keeping base chrominance intact
     result_lum = luminance(result)
     base_lum = luminance(base_reference)
     lum_delta = result_lum - base_lum
 
-    # Final combined image anchored to base RGB + luminance-guided detail addition
-    final_output = base_reference + (result - base_reference) * 0.9 + lum_delta * 0.1
+    # Final combined image anchored to base RGB + transferred luminance detail
+    final_output = base_reference + (result - base_reference) * 0.85 + lum_delta * 0.15
     return final_output.clamp(0, 1)
 
 
-# Maintain backward compatibility for tests and imports
+# Maintain backward compatibility
 def protected_detail(original, source, generated, amount):
     import torch.nn.functional as F
     if generated.shape[-2:] != original.shape[-2:]:
@@ -206,7 +224,7 @@ class DetailEngine:
         self.pipe = pipe
         return pipe
 
-    def run(self, image, *, mode='Fast Detail', preset='Detail · 896', creativity=0.20, amount=1.0, prompt='', seed=42, cancel=None, report=None, clarity=0.0, output_scale=1, time_budget=170):
+    def run(self, image, *, mode='Fast Detail', preset='Detail · 896', creativity=0.25, amount=1.2, prompt='', seed=42, cancel=None, report=None, clarity=0.3, output_scale=2, time_budget=170):
         started = time.perf_counter()
         import torch
         import torch.nn.functional as F
@@ -222,8 +240,8 @@ class DetailEngine:
         try:
             if time_budget is not None and time_budget <= 0:
                 raise ValueError('Time budget must be positive or disabled.')
-            if not 0.05 <= creativity <= 0.40 or not 0.1 <= amount <= 3.0:
-                raise ValueError('Use creativity 0.05–0.40 and texture intensity 0.1–3.0.')
+            if not 0.05 <= creativity <= 0.50 or not 0.1 <= amount <= 3.0:
+                raise ValueError('Use creativity 0.05–0.50 and texture intensity 0.1–3.0.')
             if not 0 <= clarity <= 2.0:
                 raise ValueError('Clarity must be between 0 and 2.0.')
             if output_scale not in (1, 2, 4):
@@ -255,7 +273,6 @@ class DetailEngine:
 
                 # STAGE 1: Dedicated Super-Resolution & Restoration
                 if mode == 'GPU texture boost (no new detail)':
-                    # Non-AI fast path
                     if output_scale > 1:
                         sr_canvas = F.interpolate(orig_tensor, size=(target_h, target_w), mode='bicubic', align_corners=False).clamp(0, 1)
                     else:
@@ -264,22 +281,19 @@ class DetailEngine:
                     pipe = None
                     actual_prompt = ''
                 else:
-                    # Run dedicated Real-ESRGAN restoration
                     check()
                     sr_model = self.load_sr(report)
                     check()
                     report(f'Running photographic restoration ({output_scale}× target)…', 0.10)
 
-                    # For 4x, SR directly outputs 4x
-                    # For 2x, SR outputs 4x and downsamples to crisp 2x with area antialiasing
-                    # For 1x, SR restores at 4x and downsamples to crisp 1x
-                    # Tile size 384x384 ensures GTX 1660 Ti 6GB VRAM safety (< 1.5GB peak)
+                    # Real-ESRGAN runs on GPU with 384x384 tiles (strict memory safety on GTX 1660 Ti)
                     sr_4x = tile_sr_inference(sr_model, orig_tensor, tile_size=384, overlap=32, target_scale=4)
                     check()
 
                     if output_scale == 4:
                         sr_canvas = sr_4x
                     elif output_scale == 2:
+                        # Area downsample 4x -> 2x provides crisp, aliasing-free restoration
                         sr_canvas = F.interpolate(sr_4x, size=(target_h, target_w), mode='area').clamp(0, 1)
                     else: # 1x
                         sr_canvas = F.interpolate(sr_4x, size=(target_h, target_w), mode='area').clamp(0, 1)
@@ -291,26 +305,30 @@ class DetailEngine:
                         check()
                         pipe = self.load_sd(report)
                         check()
-                        report('Encoding enhancement guidance on GPU…', 0.35)
+                        report('Encoding micro-detail guidance on GPU…', 0.35)
                         if self.prompt_cache is None or self.prompt_cache[0] != prompt:
                             self.prompt_cache = (prompt, encode_full_prompt(pipe, prompt))
                         pos_emb, neg_emb, actual_prompt = self.prompt_cache[1]
 
-                        # Diffusion operates on a high-detail working canvas
-                        edge = 768 if mode == 'Maximum Detail' else 896
-                        diff_steps = 6 if mode == 'Maximum Detail' else 8
-                        steps = math.ceil(diff_steps / max(0.1, creativity))
+                        # Working resolution for diffusion refinement (768px edge gives sharp detail without tile explosion)
+                        edge = 768
                         dw, dh = working_size((target_w, target_h), edge)
                         diff_input = F.interpolate(sr_canvas, size=(dh, dw), mode='bilinear', align_corners=False)
 
-                        tiled = (dh > 640 or dw > 640)
-                        tiles = [(x, y) for y in tile_starts(dh) for x in tile_starts(dw)] if tiled else [(0, 0)]
+                        # Determine tiles (at 768px edge, standard photo usually needs only 1 to 2 tiles)
+                        tiled = (dh > 600 or dw > 600)
+                        tiles = [(x, y) for y in tile_starts(dh, tile=512, overlap=96) for x in tile_starts(dw, tile=512, overlap=96)] if tiled else [(0, 0)]
                         diff_output = torch.zeros_like(diff_input)
                         diff_weights = torch.zeros_like(diff_input[:, :1])
                         shared_noise = torch.randn((1, 4, math.ceil(dh/8), math.ceil(dw/8)), device='cuda',
                                                    generator=torch.Generator(device='cuda').manual_seed(seed))
 
-                        report(f'Refining generative micro-detail ({len(tiles)} section(s))…', 0.40)
+                        # 12-16 total denoising steps gives high quality with low step count on DPMSolverMultistep
+                        total_steps = 14
+                        num_steps = math.ceil(total_steps * max(0.15, creativity))
+                        guidance_scale = 4.0
+
+                        report(f'Generating micro-detail texture ({len(tiles)} section(s), {num_steps} steps)…', 0.40)
                         for tile_idx, (x, y) in enumerate(tiles):
                             check()
                             th = 512 if tiled else dh
@@ -322,19 +340,19 @@ class DetailEngine:
 
                             def step_cb(_p, step, _ts, kwargs):
                                 check()
-                                prog = 0.40 + 0.45 * ((tile_idx + (step + 1) / diff_steps) / len(tiles))
-                                report(f'Micro-detail section {tile_idx+1}/{len(tiles)} · step {step+1}/{diff_steps}', min(0.85, prog))
+                                prog = 0.40 + 0.45 * ((tile_idx + (step + 1) / num_steps) / len(tiles))
+                                report(f'Micro-detail section {tile_idx+1}/{len(tiles)} · step {step+1}/{num_steps}', min(0.85, prog))
                                 return kwargs
 
                             gen_patch = pipe(
                                 prompt_embeds=pos_emb, negative_prompt_embeds=neg_emb,
-                                image=padded, strength=creativity, num_inference_steps=steps,
-                                guidance_scale=2.5, generator=torch.Generator(device='cuda').manual_seed(seed),
+                                image=padded, strength=creativity, num_inference_steps=total_steps,
+                                guidance_scale=guidance_scale, generator=torch.Generator(device='cuda').manual_seed(seed),
                                 output_type='pt', callback_on_step_end=step_cb,
                             ).images[:, :, :ph, :pw]
 
-                            # Color anchor to patch
-                            gen_patch = gen_patch + smooth_gpu(smooth_gpu(patch)) - smooth_gpu(smooth_gpu(gen_patch))
+                            # Color & illumination match to original patch
+                            gen_patch = gen_patch + smooth_gpu(patch, passes=2) - smooth_gpu(gen_patch, passes=2)
                             wy = torch.sin(torch.linspace(0.05, math.pi - 0.05, ph, device='cuda')) ** 2
                             wx = torch.sin(torch.linspace(0.05, math.pi - 0.05, pw, device='cuda')) ** 2
                             wgt = (wy[:, None] * wx[None, :])[None, None]
@@ -343,26 +361,26 @@ class DetailEngine:
 
                         diff_output /= diff_weights.clamp_min(1e-8)
                         diff_upscaled = F.interpolate(diff_output, size=(target_h, target_w), mode='bilinear', align_corners=False)
-                        # Blend diffusion micro-detail onto SR canvas
-                        enhanced_candidate = structure_preserving_blend(sr_canvas, diff_upscaled, amount=amount * 0.8)
-                    else:
-                        # Fast Detail: Direct photographic SR is candidate
-                        enhanced_candidate = sr_canvas
 
-                    # STAGE 3: Final conservative structure blend and clarity
+                        # Extract high-frequency generative detail and transfer onto the super-resolved canvas
+                        report('Transferring micro-detail textures…', 0.88)
+                        diff_high = diff_upscaled - smooth_gpu(diff_upscaled, passes=1)
+                        # Inject novel generative pores, fine hairs, and weave directly onto SR canvas
+                        sr_canvas = (sr_canvas + diff_high * (amount * 0.9)).clamp(0, 1)
+
+                    # STAGE 3: Final structure-preserving blend & micro-contrast
                     check()
-                    report('Applying structure-preserving detail blend on GPU…', 0.90)
-                    # High quality base reference at output resolution
+                    report('Applying structure-preserving detail blend on GPU…', 0.92)
                     if output_scale > 1:
                         base_ref = F.interpolate(orig_tensor, size=(target_h, target_w), mode='bicubic', align_corners=False).clamp(0, 1)
                     else:
                         base_ref = orig_tensor
 
-                    blended = structure_preserving_blend(base_ref, enhanced_candidate, amount=amount)
+                    blended = structure_preserving_blend(base_ref, sr_canvas, amount=amount)
 
-                    # Add clarity if enabled
+                    # Micro-contrast clarity
                     if clarity > 0:
-                        report('Enhancing micro-contrast clarity…', 0.95)
+                        report('Enhancing micro-contrast clarity…', 0.96)
                         result = clarity_gpu(blended, clarity)
                     else:
                         result = blended
@@ -374,7 +392,7 @@ class DetailEngine:
 
                 elapsed = time.perf_counter() - started
                 info = dict(
-                    pipeline_version=9,
+                    pipeline_version=10,
                     architecture='RealESRGAN-RRDBNet + Optional-Diffusion-MicroDetail',
                     mode=mode,
                     preset=preset,
