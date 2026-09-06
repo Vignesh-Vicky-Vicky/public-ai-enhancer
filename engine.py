@@ -76,16 +76,17 @@ class Cancelled(RuntimeError):
 
 
 def smooth_gpu(t, passes=1):
-    """Gaussian smoothing kernel for frequency separation."""
+    """Gaussian smoothing kernel for frequency separation (supports 1 or 3 channels)."""
     import torch
     import torch.nn.functional as F
+    channels = t.shape[1]
     kernel = torch.tensor([1, 4, 6, 4, 1], device=t.device, dtype=t.dtype) / 16.0
-    k_h = kernel.view(1, 1, 1, 5).expand(3, 1, 1, 5)
-    k_v = kernel.view(1, 1, 5, 1).expand(3, 1, 5, 1)
+    k_h = kernel.view(1, 1, 1, 5).expand(channels, 1, 1, 5)
+    k_v = kernel.view(1, 1, 5, 1).expand(channels, 1, 5, 1)
     out = t
     for _ in range(passes):
-        out = F.conv2d(F.pad(out, (2, 2, 0, 0), mode='replicate'), k_h, groups=3)
-        out = F.conv2d(F.pad(out, (0, 0, 2, 2), mode='replicate'), k_v, groups=3)
+        out = F.conv2d(F.pad(out, (2, 2, 0, 0), mode='replicate'), k_h, groups=channels)
+        out = F.conv2d(F.pad(out, (0, 0, 2, 2), mode='replicate'), k_v, groups=channels)
     return out
 
 
