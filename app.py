@@ -128,9 +128,14 @@ class App:
         footer = tk.Frame(root, bg=PANEL, padx=16, pady=14, highlightbackground=BORDER, highlightthickness=1)
         footer.pack(fill='x', padx=28, pady=(0, 20))
         self.status = tk.StringVar(value='Open an image to begin. AI model setup is required once; processing stays offline.')
-        tk.Label(footer, textvariable=self.status, bg=PANEL, fg=FG, anchor='w', wraplength=1000).pack(fill='x')
+        status_row = tk.Frame(footer, bg=PANEL)
+        status_row.pack(fill='x')
+        tk.Label(status_row, textvariable=self.status, bg=PANEL, fg=FG, anchor='w', wraplength=900).pack(side='left', fill='x', expand=True)
+        self.progress_pct = tk.StringVar(value='0%')
+        self.progress_label = tk.Label(status_row, textvariable=self.progress_pct, bg=PANEL, fg=ACCENT, font=('Segoe UI', 10, 'bold'), width=5, anchor='e')
+        self.progress_label.pack(side='right', padx=(8, 0))
         self.progress = ttk.Progressbar(footer, maximum=1)
-        self.progress.pack(fill='x', pady=10)
+        self.progress.pack(fill='x', pady=(6, 10))
         actions = tk.Frame(footer, bg=PANEL)
         actions.pack(fill='x')
         self.run_button = ttk.Button(actions, text='✦  Enhance image', style='Primary.TButton', command=self.run, state='disabled')
@@ -185,6 +190,7 @@ class App:
         self.prompt.delete('1.0', 'end')
         self.cancel.clear()
         self.progress['value'] = 0
+        self.progress_pct.set('0%')
         self.run_button.config(state='disabled')
         self.save_button.config(state='disabled')
         self.cancel_button.config(state='disabled')
@@ -288,6 +294,7 @@ class App:
             widget.config(state='disabled')
         self.status.set('Starting GPU enhancement…')
         self.progress['value'] = 0
+        self.progress_pct.set('0%')
         source = self.original.copy()
         def worker():
             try:
@@ -307,6 +314,7 @@ class App:
                 if not self.cancel.is_set():
                     self.status.set(data[0])
                 self.progress['value'] = data[1]
+                self.progress_pct.set(f'{int(round(data[1] * 100))}%')
             else:
                 self.busy = False
                 self.open_button.config(state='normal')
@@ -325,6 +333,8 @@ class App:
                     self.result, self.info = data
                     self.draw()
                     self.save_button.config(state='normal')
+                    self.progress['value'] = 1.0
+                    self.progress_pct.set('100%')
                     self.clock.set(f"{self.info['seconds']:.1f}s · {self.info['gpu']} · AI work size {self.info['working_size'][0]} × {self.info['working_size'][1]}")
                 else:
                     self.status.set(data[0])

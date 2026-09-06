@@ -70,14 +70,15 @@ class RRDBNet(nn.Module):
         return out
 
 
-def tile_sr_inference(model, tensor, tile_size=384, overlap=32, target_scale=4):
-    """Run super-resolution inference on GPU using overlapping tiles to guarantee safety on 6GB VRAM.
+def tile_sr_inference(model, tensor, tile_size=384, overlap=32, target_scale=4, progress_cb=None):
+    """Run super-resolution inference on GPU using overlapping tiles with progress callbacks.
     Args:
         model: RRDBNet model
         tensor: (1, 3, H, W) normalized to [0, 1] on GPU
         tile_size: input tile size
         overlap: pixel overlap between input tiles
         target_scale: 4 for RRDBNet
+        progress_cb: optional callable(tile_index, total_tiles)
     Returns:
         (1, 3, H*scale, W*scale) tensor on GPU
     """
@@ -86,7 +87,12 @@ def tile_sr_inference(model, tensor, tile_size=384, overlap=32, target_scale=4):
     out_h, out_w = h * scale, w * scale
 
     if h <= tile_size and w <= tile_size:
-        return model(tensor).clamp(0, 1)
+        if progress_cb is not None:
+            progress_cb(0, 1)
+        res = model(tensor).clamp(0, 1)
+        if progress_cb is not None:
+            progress_cb(1, 1)
+        return res
 
     output = torch.zeros((b, c, out_h, out_w), device=tensor.device, dtype=tensor.dtype)
     weights = torch.zeros((b, 1, out_h, out_w), device=tensor.device, dtype=tensor.dtype)
@@ -108,8 +114,13 @@ def tile_sr_inference(model, tensor, tile_size=384, overlap=32, target_scale=4):
         x_starts.append(max(0, w - tile_size))
     x_starts = sorted(set(x_starts))
 
+    total_tiles = len(y_starts) * len(x_starts)
+    curr_tile = 0
+
     for y in y_starts:
         for x in x_starts:
+            if progress_cb is not None:
+                progress_cb(curr_tile, total_tiles)
             th = min(tile_size, h - y)
             tw = min(tile_size, w - x)
             patch = tensor[:, :, y:y + th, x:x + tw]
@@ -121,6 +132,10 @@ def tile_sr_inference(model, tensor, tile_size=384, overlap=32, target_scale=4):
             weight = make_weight_window(th, tw, tensor.device, tensor.dtype)
             output[:, :, out_y:out_y + out_th, out_x:out_x + out_tw] += sr_patch * weight
             weights[:, :, out_y:out_y + out_th, out_x:out_x + out_tw] += weight
+            curr_tile += 1
+
+    if progress_cb is not None:
+        progress_cb(total_tiles, total_tiles)
 
     output /= weights.clamp_min(1e-7)
     return output.clamp(0, 1)

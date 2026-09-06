@@ -2,6 +2,7 @@
 Stage 1: Dedicated Real-ESRGAN super-resolution/restoration directly at target resolution (1x, 2x, 4x).
 Stage 2 (Optional): High-frequency diffusion micro-detail generator (pores, fine hairs, iris detail, fabric weave).
 Stage 3: Structure-preserving frequency blend anchoring identity and geometry while transferring rich high-frequency textures.
+Accurate end-to-end 0-100% progress weighting across all pipeline phases.
 """
 import os
 os.environ['HF_HUB_OFFLINE'] = '1'
@@ -122,8 +123,7 @@ def structure_preserving_blend(base_reference, enhanced_texture, amount=1.0):
     # Confidence mask: 1.0 where base geometry matches, gently tapering if major distortions occur
     confidence = torch.exp(-diff_lum * 6.0)
 
-    # 4. Transfer high frequencies
-    # Transfer the high-frequency difference scaled by amount and confidence
+    # 4. Transfer high frequencies scaled by amount and confidence
     novel_high = (enh_high - base_high) * confidence
     blended_high = base_high + novel_high * amount
 
@@ -161,7 +161,7 @@ class DetailEngine:
         self.lock = threading.Lock()
         self.prompt_cache = None
 
-    def load_sr(self, report):
+    def load_sr(self, report_sub):
         """Load Real-ESRGAN super-resolution/restoration weights on GPU."""
         import torch
         if not torch.cuda.is_available():
@@ -169,11 +169,11 @@ class DetailEngine:
         if self.sr_model is not None:
             return self.sr_model
 
-        report('Loading photographic super-resolution model…', 0.02)
+        report_sub('Loading photographic super-resolution weights…', 0.5)
         sr_path = ROOT / 'models' / 'sr' / 'RealESRGAN_x4.pth'
         if not sr_path.exists():
             from huggingface_hub import hf_hub_download
-            report('Downloading Real-ESRGAN weights (~64MB)…', 0.01)
+            report_sub('Downloading Real-ESRGAN weights (~64MB)…', 0.2)
             sr_path.parent.mkdir(parents=True, exist_ok=True)
             hf_hub_download(repo_id='ai-forever/Real-ESRGAN', filename='RealESRGAN_x4.pth', local_dir=str(sr_path.parent), token=False)
             (sr_path.parent / '.ready').write_text('Downloaded successfully\n')
@@ -185,9 +185,10 @@ class DetailEngine:
         model.load_state_dict(state, strict=True)
         model.to('cuda').eval()
         self.sr_model = model
+        report_sub('Photographic super-resolution model ready on GPU', 1.0)
         return model
 
-    def load_sd(self, report):
+    def load_sd(self, report_sub):
         """Load Stable Diffusion 1.5 pipeline on GPU (FP32 safe for GTX 1660 Ti)."""
         import torch
         if not torch.cuda.is_available():
@@ -198,7 +199,7 @@ class DetailEngine:
         model = ROOT / 'models' / 'sd15'
         if not (model / '.ready').exists():
             raise RuntimeError('Diffusion model is missing. Run download_model.py once with internet access.')
-        report('Loading diffusion micro-detail pipeline…', 0.05)
+        report_sub('Loading diffusion micro-detail pipeline…', 0.5)
         from diffusers import StableDiffusionImg2ImgPipeline, DPMSolverMultistepScheduler
         class ConsistentPipeline(StableDiffusionImg2ImgPipeline):
             section_noise = None
@@ -222,9 +223,10 @@ class DetailEngine:
         pipe.set_progress_bar_config(disable=True)
         pipe.to('cuda')
         self.pipe = pipe
+        report_sub('Diffusion pipeline ready on GPU', 1.0)
         return pipe
 
-    def run(self, image, *, mode='Fast Detail', preset='Detail · 896', creativity=0.25, amount=1.2, prompt='', seed=42, cancel=None, report=None, clarity=0.3, output_scale=2, time_budget=170):
+    def run(self, image, *, mode='Fast Detail', preset='Detail · 896', creativity=0.25, amount=1.2, prompt='', seed=42, cancel=None, report=None, clarity=0.35, output_scale=2, time_budget=170):
         started = time.perf_counter()
         import torch
         import torch.nn.functional as F
@@ -256,6 +258,22 @@ class DetailEngine:
             if image.width * image.height * output_scale**2 > 64_000_000:
                 raise ValueError('Output exceeds 64 megapixels. Choose a smaller scale or input image.')
 
+            # Job Phase Progress Allocations (True 0.0 to 1.0 weighted progress)
+            # Fast Detail:
+            #  0.00 - 0.05: Prep & Image to GPU
+            #  0.05 - 0.15: Model Load (if not cached)
+            #  0.15 - 0.85: Photographic Super-Resolution Reconstruction
+            #  0.85 - 0.95: Blending & Micro-Contrast Clarity
+            #  0.95 - 1.00: GPU->CPU Transfer and Output PNG Prep
+            # Maximum Detail:
+            #  0.00 - 0.03: Prep & Image to GPU
+            #  0.03 - 0.10: Model Loads (SR & SD)
+            #  0.10 - 0.45: Photographic Super-Resolution Reconstruction
+            #  0.45 - 0.85: Generative Micro-Detail Diffusion Refinement
+            #  0.85 - 0.95: Blending & Micro-Contrast Clarity
+            #  0.95 - 1.00: GPU->CPU Transfer and Output PNG Prep
+            is_max = (mode == 'Maximum Detail' or mode == 'AI micro-detail at output resolution')
+
             def check():
                 if cancel.is_set():
                     raise Cancelled('Cancelled. No partial image was saved.')
@@ -264,7 +282,7 @@ class DetailEngine:
 
             with torch.inference_mode():
                 check()
-                report('Preparing image on GPU…', 0.03)
+                report('Preparing image on GPU…', 0.02)
                 img_array = np.array(image.convert('RGB'), copy=True)
                 orig_tensor = torch.from_numpy(img_array).to('cuda', dtype=torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0
 
@@ -273,27 +291,37 @@ class DetailEngine:
 
                 # STAGE 1: Dedicated Super-Resolution & Restoration
                 if mode == 'GPU texture boost (no new detail)':
+                    report('Scaling image canvas…', 0.20)
                     if output_scale > 1:
                         sr_canvas = F.interpolate(orig_tensor, size=(target_h, target_w), mode='bicubic', align_corners=False).clamp(0, 1)
                     else:
                         sr_canvas = orig_tensor
+                    report('Applying clarity on GPU…', 0.70)
                     result = clarity_gpu(sr_canvas, clarity)
                     pipe = None
                     actual_prompt = ''
                 else:
                     check()
-                    sr_model = self.load_sr(report)
+                    # Loading SR weights
+                    sr_model = self.load_sr(lambda txt, p: report(txt, 0.03 + (0.07 if is_max else 0.12) * p))
                     check()
-                    report(f'Running photographic restoration ({output_scale}× target)…', 0.10)
 
-                    # Real-ESRGAN runs on GPU with 384x384 tiles (strict memory safety on GTX 1660 Ti)
-                    sr_4x = tile_sr_inference(sr_model, orig_tensor, tile_size=384, overlap=32, target_scale=4)
+                    sr_start_p = 0.10 if is_max else 0.15
+                    sr_end_p = 0.45 if is_max else 0.85
+
+                    def sr_progress(tile_idx, total):
+                        check()
+                        frac = tile_idx / max(1, total)
+                        curr_p = sr_start_p + (sr_end_p - sr_start_p) * frac
+                        report(f'Photographic SR reconstruction ({output_scale}×) · section {min(tile_idx+1, total)}/{total}', curr_p)
+
+                    # Real-ESRGAN tiled GPU reconstruction
+                    sr_4x = tile_sr_inference(sr_model, orig_tensor, tile_size=384, overlap=32, target_scale=4, progress_cb=sr_progress)
                     check()
 
                     if output_scale == 4:
                         sr_canvas = sr_4x
                     elif output_scale == 2:
-                        # Area downsample 4x -> 2x provides crisp, aliasing-free restoration
                         sr_canvas = F.interpolate(sr_4x, size=(target_h, target_w), mode='area').clamp(0, 1)
                     else: # 1x
                         sr_canvas = F.interpolate(sr_4x, size=(target_h, target_w), mode='area').clamp(0, 1)
@@ -301,11 +329,11 @@ class DetailEngine:
                     # STAGE 2: Optional Generative Micro-Detail Diffusion Refinement
                     pipe = None
                     actual_prompt = ''
-                    if mode == 'Maximum Detail' or mode == 'AI micro-detail at output resolution':
+                    if is_max:
                         check()
-                        pipe = self.load_sd(report)
+                        pipe = self.load_sd(lambda txt, p: report(txt, 0.45 + 0.05 * p))
                         check()
-                        report('Encoding micro-detail guidance on GPU…', 0.35)
+                        report('Encoding micro-detail guidance on GPU…', 0.51)
                         if self.prompt_cache is None or self.prompt_cache[0] != prompt:
                             self.prompt_cache = (prompt, encode_full_prompt(pipe, prompt))
                         pos_emb, neg_emb, actual_prompt = self.prompt_cache[1]
@@ -315,7 +343,6 @@ class DetailEngine:
                         dw, dh = working_size((target_w, target_h), edge)
                         diff_input = F.interpolate(sr_canvas, size=(dh, dw), mode='bilinear', align_corners=False)
 
-                        # Determine tiles (at 768px edge, standard photo usually needs only 1 to 2 tiles)
                         tiled = (dh > 600 or dw > 600)
                         tiles = [(x, y) for y in tile_starts(dh, tile=512, overlap=96) for x in tile_starts(dw, tile=512, overlap=96)] if tiled else [(0, 0)]
                         diff_output = torch.zeros_like(diff_input)
@@ -323,12 +350,14 @@ class DetailEngine:
                         shared_noise = torch.randn((1, 4, math.ceil(dh/8), math.ceil(dw/8)), device='cuda',
                                                    generator=torch.Generator(device='cuda').manual_seed(seed))
 
-                        # 12-16 total denoising steps gives high quality with low step count on DPMSolverMultistep
                         total_steps = 14
                         num_steps = math.ceil(total_steps * max(0.15, creativity))
                         guidance_scale = 4.0
 
-                        report(f'Generating micro-detail texture ({len(tiles)} section(s), {num_steps} steps)…', 0.40)
+                        diff_start_p = 0.52
+                        diff_end_p = 0.85
+
+                        report(f'Generating micro-detail texture ({len(tiles)} section(s), {num_steps} steps)…', diff_start_p)
                         for tile_idx, (x, y) in enumerate(tiles):
                             check()
                             th = 512 if tiled else dh
@@ -340,8 +369,9 @@ class DetailEngine:
 
                             def step_cb(_p, step, _ts, kwargs):
                                 check()
-                                prog = 0.40 + 0.45 * ((tile_idx + (step + 1) / num_steps) / len(tiles))
-                                report(f'Micro-detail section {tile_idx+1}/{len(tiles)} · step {step+1}/{num_steps}', min(0.85, prog))
+                                step_frac = (tile_idx + (step + 1) / num_steps) / len(tiles)
+                                curr_p = diff_start_p + (diff_end_p - diff_start_p) * step_frac
+                                report(f'Micro-detail section {tile_idx+1}/{len(tiles)} · step {step+1}/{num_steps}', curr_p)
                                 return kwargs
 
                             gen_patch = pipe(
@@ -363,14 +393,14 @@ class DetailEngine:
                         diff_upscaled = F.interpolate(diff_output, size=(target_h, target_w), mode='bilinear', align_corners=False)
 
                         # Extract high-frequency generative detail and transfer onto the super-resolved canvas
-                        report('Transferring micro-detail textures…', 0.88)
+                        report('Transferring micro-detail textures…', 0.86)
                         diff_high = diff_upscaled - smooth_gpu(diff_upscaled, passes=1)
                         # Inject novel generative pores, fine hairs, and weave directly onto SR canvas
                         sr_canvas = (sr_canvas + diff_high * (amount * 0.9)).clamp(0, 1)
 
                     # STAGE 3: Final structure-preserving blend & micro-contrast
                     check()
-                    report('Applying structure-preserving detail blend on GPU…', 0.92)
+                    report('Applying structure-preserving detail blend on GPU…', 0.88)
                     if output_scale > 1:
                         base_ref = F.interpolate(orig_tensor, size=(target_h, target_w), mode='bicubic', align_corners=False).clamp(0, 1)
                     else:
@@ -380,12 +410,13 @@ class DetailEngine:
 
                     # Micro-contrast clarity
                     if clarity > 0:
-                        report('Enhancing micro-contrast clarity…', 0.96)
+                        report('Enhancing micro-contrast clarity…', 0.92)
                         result = clarity_gpu(blended, clarity)
                     else:
                         result = blended
 
                 check()
+                report('Transferring image from GPU and preparing output…', 0.96)
                 result = result.clamp(0, 1)
                 array = (result.squeeze(0).permute(1, 2, 0) * 255.0).round().to(torch.uint8).cpu().numpy()
                 torch.cuda.synchronize()
