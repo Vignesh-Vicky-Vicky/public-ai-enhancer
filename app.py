@@ -1,4 +1,4 @@
-"""Local desktop interface for Detail Lab."""
+"""Local desktop interface for Detail Lab - Extreme Generative Micro-Detail Reconstruction."""
 import json
 import queue
 import threading
@@ -7,7 +7,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from PIL import Image, ImageOps, ImageTk
-from engine import DetailEngine, PRESETS, Cancelled, DETAIL_PROMPT
+from engine import DetailEngine, Cancelled
 
 BG, PANEL, FG, MUTED, ACCENT = '#090e18', '#151f30', '#f1f5ff', '#92a4bf', '#69dfce'
 BORDER, WELL = '#2b3c54', '#0c1422'
@@ -16,9 +16,9 @@ BORDER, WELL = '#2b3c54', '#0c1422'
 class App:
     def __init__(self, root):
         self.root = root
-        root.title('Detail Lab 9 · Photographic Super-Resolution & Detail')
-        root.geometry('1280x880')
-        root.minsize(920, 720)
+        root.title('Detail Lab · Extreme Micro-Detail & Super-Resolution')
+        root.geometry('1340x900')
+        root.minsize(980, 720)
         root.configure(bg=BG)
         self.engine = DetailEngine()
         self.events = queue.Queue()
@@ -33,89 +33,114 @@ class App:
         self.center = [0.5, 0.5]
         self.drag_origin = None
         self.zoom_text = tk.StringVar(value='Fit')
+
         style = ttk.Style()
         style.theme_use('clam')
         style.configure('.', background=BG, foreground=FG, font=('Segoe UI', 10))
         style.configure('TButton', background=PANEL, padding=9)
         style.map('TButton', background=[('active', '#34445c')])
-        style.configure('Primary.TButton', background=ACCENT, foreground='#082621', font=('Segoe UI', 11, 'bold'), padding=(18, 12), borderwidth=0)
+        style.configure('Primary.TButton', background=ACCENT, foreground='#082621', font=('Segoe UI', 11, 'bold'), padding=(20, 12), borderwidth=0)
         style.map('Primary.TButton', background=[('disabled', '#243c43'), ('active', '#9aefdf')], foreground=[('disabled', '#758a96')])
         style.configure('Stop.TButton', background='#3a2431', foreground='#ffbbca', padding=(14, 12))
         style.map('Stop.TButton', background=[('disabled', PANEL), ('active', '#573244')])
-        style.configure('TCheckbutton', background=PANEL)
-        style.configure('TCombobox', fieldbackground=PANEL, background=PANEL, foreground=FG)
-        style.map('TCombobox', fieldbackground=[('readonly', PANEL)], foreground=[('readonly', FG)])
+        style.configure('TRadiobutton', background=PANEL, foreground=FG, font=('Segoe UI', 10, 'bold'))
+        style.map('TRadiobutton', background=[('active', PANEL)])
         style.configure('Horizontal.TProgressbar', troughcolor=PANEL, background=ACCENT)
+
+        # Header
         header = tk.Frame(root, bg=BG)
-        header.pack(fill='x', padx=28, pady=(22, 14))
+        header.pack(fill='x', padx=28, pady=(20, 12))
         tk.Label(header, text='◈', bg=BG, fg=ACCENT, font=('Segoe UI', 30)).pack(side='left', padx=(0, 12))
         tk.Label(header, text='DETAIL LAB', bg=BG, fg=FG, font=('Segoe UI', 26, 'bold')).pack(side='left')
-        tk.Label(header, text='TEXTURE & SUPER-RESOLUTION  /  09', bg=BG, fg=MUTED, font=('Segoe UI', 10)).pack(side='left', padx=18)
-        tk.Label(header, text='●  LOCAL GPU', bg='#173331', fg=ACCENT, padx=16, pady=9, font=('Segoe UI', 10, 'bold')).pack(side='right')
-        tk.Label(root, text='Photographic super-resolution & micro-detail. Identity and geometry preserved.', bg=BG, fg=MUTED, font=('Segoe UI', 12)).pack(anchor='w', padx=28)
+        tk.Label(header, text='EXTREME AI DETAIL ENHANCER', bg=BG, fg=MUTED, font=('Segoe UI', 10)).pack(side='left', padx=18)
+        self.gpu_badge = tk.Label(header, text='●  LOCAL GPU (GTX 1660 Ti)', bg='#173331', fg=ACCENT, padx=16, pady=8, font=('Segoe UI', 10, 'bold'))
+        self.gpu_badge.pack(side='right')
+
+        tk.Label(root, text='One-click photographic super-resolution & generative microstructure synthesis. Hallucinates missing details.', bg=BG, fg=MUTED, font=('Segoe UI', 11)).pack(anchor='w', padx=28)
+
         body = tk.Frame(root, bg=BG)
-        body.pack(fill='both', expand=True, padx=28, pady=18)
-        sidebar = tk.Frame(body, bg=PANEL, highlightbackground=BORDER, highlightthickness=1, padx=10, pady=12)
+        body.pack(fill='both', expand=True, padx=28, pady=14)
+
+        # Simplified Sidebar
+        sidebar = tk.Frame(body, bg=PANEL, highlightbackground=BORDER, highlightthickness=1, padx=14, pady=16, width=320)
         sidebar.pack(side='left', fill='y', padx=(0, 16))
-        scroll = tk.Canvas(sidebar, bg=PANEL, width=280, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(sidebar, orient='vertical', command=scroll.yview)
-        scroll.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side='right', fill='y')
-        scroll.pack(side='left', fill='y', expand=True)
-        controls = tk.Frame(scroll, bg=PANEL)
-        scroll.create_window(0, 0, window=controls, anchor='nw', width=280)
-        controls.bind('<Configure>', lambda event: scroll.configure(scrollregion=scroll.bbox('all')))
-        self.section(controls, '01', 'Source & output')
-        self.open_button = ttk.Button(controls, text='+  Open photograph', command=self.open_image)
-        self.open_button.pack(fill='x', pady=(0, 16))
-        self.mode = tk.StringVar(value='Fast Detail')
-        self.preset = tk.StringVar(value='Detail · 896')
-        self.creativity = tk.DoubleVar(value=.25)
-        self.amount = tk.DoubleVar(value=1.2)
-        self.clarity = tk.DoubleVar(value=0.35)
-        self.seed = tk.StringVar(value='42')
-        self.output_scale = tk.StringVar(value='2× output')
-        self.limit_time = tk.BooleanVar(value=True)
-        self.inputs = []
-        for label, var, options in [('Enhancement', self.mode, ['Fast Detail', 'Maximum Detail']), ('Output size', self.output_scale, ['1× original size', '2× output', '4× output'])]:
-            self.label(controls, label)
-            box = ttk.Combobox(controls, textvariable=var, values=options, state='readonly')
-            box.pack(fill='x', pady=(0, 12))
-            self.inputs.append(box)
-        budget = ttk.Checkbutton(controls, text='Stop unfinished jobs near 180 seconds', variable=self.limit_time)
-        budget.pack(fill='x', pady=(0, 8))
-        self.inputs.append(budget)
-        tk.Label(controls, text='Fast: Dedicated photographic SR (2×/4× reconstructed in seconds).\nMaximum: SR + generative diffusion micro-detail refinement.', wraplength=270, bg=PANEL, fg=MUTED, justify='left').pack(fill='x', pady=(0, 12))
-        self.section(controls, '02', 'Texture & preservation')
-        for label, var, low, high, resolution in [('Micro-detail creativity (Maximum mode)', self.creativity, .05, .50, .01), ('Texture blend intensity', self.amount, .1, 2.5, .05), ('Micro-contrast clarity', self.clarity, 0, 2, .05)]:
-            self.label(controls, label)
-            scale = tk.Scale(controls, variable=var, from_=low, to=high, resolution=resolution, orient='horizontal', bg=PANEL, fg=ACCENT, activebackground=ACCENT, troughcolor=WELL, highlightthickness=0, sliderrelief='flat')
-            scale.pack(fill='x', pady=(0, 2))
-            self.inputs.append(scale)
-        self.section(controls, '03', 'Image guidance')
-        self.label(controls, 'Extra image guidance (optional)')
-        self.prompt = tk.Text(controls, height=3, bg=WELL, fg=FG, insertbackground=FG, relief='flat', wrap='word', padx=8, pady=8, font=('Segoe UI', 10))
-        self.prompt.pack(fill='x', pady=(5, 10))
-        self.inputs.append(self.prompt)
-        self.label(controls, 'Seed · same settings, repeatable result')
-        entry = ttk.Entry(controls, textvariable=self.seed)
-        entry.pack(fill='x', pady=(5, 12))
-        self.inputs.append(entry)
+        sidebar.pack_propagate(False)
+
+        # Section 01: Source
+        self.section(sidebar, '01', 'SOURCE')
+        self.open_button = ttk.Button(sidebar, text='+  Open photograph', command=self.open_image)
+        self.open_button.pack(fill='x', pady=(0, 10))
+        self.source_dim_label = tk.Label(sidebar, text='No photograph loaded', bg=WELL, fg=MUTED, pady=8, font=('Segoe UI', 9))
+        self.source_dim_label.pack(fill='x', pady=(0, 20))
+
+        # Section 02: Output Size (The ONLY user setting)
+        self.section(sidebar, '02', 'OUTPUT SIZE')
+        self.output_scale = tk.IntVar(value=2)
+        scale_frame = tk.Frame(sidebar, bg=PANEL)
+        scale_frame.pack(fill='x', pady=(0, 10))
+
+        self.r2 = ttk.Radiobutton(scale_frame, text='2×', variable=self.output_scale, value=2, command=self.update_expected_dims)
+        self.r2.pack(side='left', padx=(10, 20))
+        self.r4 = ttk.Radiobutton(scale_frame, text='4×', variable=self.output_scale, value=4, command=self.update_expected_dims)
+        self.r4.pack(side='left', padx=10)
+
+        self.target_dim_label = tk.Label(sidebar, text='Target: —', bg=WELL, fg=ACCENT, pady=8, font=('Segoe UI', 9, 'bold'))
+        self.target_dim_label.pack(fill='x', pady=(0, 20))
+
+        # Real Pipeline Activity Panel
+        self.section(sidebar, '03', 'PIPELINE ACTIVITY')
+        self.activity_frame = tk.Frame(sidebar, bg=WELL, padx=10, pady=10)
+        self.activity_frame.pack(fill='both', expand=True, pady=(0, 10))
+
+        self.stage_labels = {}
+        stages = [
+            ('analyze', 'Analyzing image'),
+            ('sr_base', 'Neural super-resolution base'),
+            ('gen_detail', 'Generating photographic details'),
+            ('materials', 'Material microstructure'),
+            ('refine', 'Ultra-detail refinement'),
+            ('safety', 'Artifact safety check'),
+        ]
+        for key, name in stages:
+            row = tk.Frame(self.activity_frame, bg=WELL)
+            row.pack(fill='x', pady=3)
+            name_lbl = tk.Label(row, text=name, bg=WELL, fg=MUTED, font=('Segoe UI', 9), anchor='w')
+            name_lbl.pack(side='left')
+            status_lbl = tk.Label(row, text='—', bg=WELL, fg=MUTED, font=('Segoe UI', 9), width=8, anchor='e')
+            status_lbl.pack(side='right')
+            self.stage_labels[key] = (name_lbl, status_lbl)
+
+        # Hardware & telemetry display in sidebar
+        self.hw_info_label = tk.Label(
+            sidebar,
+            text='GPU: GTX 1660 Ti 6GB\nMode: Extreme Micro-Detail\nTiling: 512px Hann Overlap',
+            bg=PANEL, fg=MUTED, font=('Segoe UI', 8), justify='left'
+        )
+        self.hw_info_label.pack(anchor='w', pady=(8, 0))
+
+        # Right Preview Area
         self.preview = tk.Frame(body, bg=BG)
         self.preview.pack(side='left', fill='both', expand=True)
+
         toolbar = tk.Frame(self.preview, bg=PANEL, padx=10, pady=8, highlightbackground=BORDER, highlightthickness=1)
         toolbar.pack(fill='x', pady=(0, 8))
-        for label, command in [('−', lambda: self.change_zoom(.8)), ('+', lambda: self.change_zoom(1.25)), ('100%', lambda: self.set_zoom(1.0)), ('200%', lambda: self.set_zoom(2.0)), ('400%', lambda: self.set_zoom(4.0)), ('Fit', lambda: self.set_zoom(None))]:
+        for label, command in [
+            ('−', lambda: self.change_zoom(.8)), ('+', lambda: self.change_zoom(1.25)),
+            ('100%', lambda: self.set_zoom(1.0)), ('200%', lambda: self.set_zoom(2.0)),
+            ('332%', lambda: self.set_zoom(3.32)), ('400%', lambda: self.set_zoom(4.0)),
+            ('Fit', lambda: self.set_zoom(None))
+        ]:
             ttk.Button(toolbar, text=label, command=command, width=5).pack(side='left', padx=2)
         tk.Label(toolbar, textvariable=self.zoom_text, bg=PANEL, fg=ACCENT).pack(side='left', padx=8)
+
         image_row = tk.Frame(self.preview, bg=BG)
         image_row.pack(fill='both', expand=True)
         self.canvases = []
-        for title in ['ORIGINAL', 'DETAIL BOOST']:
+        for title in ['ORIGINAL', 'EXTREME DETAIL RECONSTRUCTION']:
             frame = tk.Frame(image_row, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
             frame.pack(side='left', fill='both', expand=True, padx=4)
-            tk.Frame(frame, bg=ACCENT if title == 'DETAIL BOOST' else '#506383', height=3).pack(fill='x')
-            tk.Label(frame, text=title, bg=PANEL, fg=ACCENT if title == 'DETAIL BOOST' else MUTED, font=('Segoe UI', 10, 'bold')).pack(pady=12)
+            tk.Frame(frame, bg=ACCENT if 'RECONSTRUCTION' in title else '#506383', height=3).pack(fill='x')
+            tk.Label(frame, text=title, bg=PANEL, fg=ACCENT if 'RECONSTRUCTION' in title else MUTED, font=('Segoe UI', 10, 'bold')).pack(pady=10)
             canvas = tk.Canvas(frame, bg=WELL, highlightthickness=0, width=250, cursor='fleur')
             canvas.pack(fill='both', expand=True)
             canvas.bind('<Configure>', lambda event: self.draw())
@@ -124,18 +149,23 @@ class App:
             canvas.bind('<B1-Motion>', self.pan)
             canvas.bind('<Double-Button-1>', lambda event: self.set_zoom(1.0))
             self.canvases.append(canvas)
-        tk.Label(self.preview, text='LINKED VIEWS   ·   Mouse wheel to zoom   ·   Drag either image to pan both', bg=BG, fg=MUTED, font=('Segoe UI', 9)).pack(pady=(10, 0))
-        footer = tk.Frame(root, bg=PANEL, padx=16, pady=14, highlightbackground=BORDER, highlightthickness=1)
-        footer.pack(fill='x', padx=28, pady=(0, 20))
-        self.status = tk.StringVar(value='Open an image to begin. AI model setup is required once; processing stays offline.')
+
+        tk.Label(self.preview, text='LINKED VIEWS   ·   Mouse wheel to zoom   ·   Drag either image to pan both   ·   Inspect at 100%–400% for micro-detail', bg=BG, fg=MUTED, font=('Segoe UI', 9)).pack(pady=(8, 0))
+
+        # Footer
+        footer = tk.Frame(root, bg=PANEL, padx=16, pady=12, highlightbackground=BORDER, highlightthickness=1)
+        footer.pack(fill='x', padx=28, pady=(0, 16))
+        self.status = tk.StringVar(value='Open an image to begin. Pure local GPU inference.')
         status_row = tk.Frame(footer, bg=PANEL)
         status_row.pack(fill='x')
-        tk.Label(status_row, textvariable=self.status, bg=PANEL, fg=FG, anchor='w', wraplength=900).pack(side='left', fill='x', expand=True)
+        tk.Label(status_row, textvariable=self.status, bg=PANEL, fg=FG, anchor='w', wraplength=950).pack(side='left', fill='x', expand=True)
         self.progress_pct = tk.StringVar(value='0%')
-        self.progress_label = tk.Label(status_row, textvariable=self.progress_pct, bg=PANEL, fg=ACCENT, font=('Segoe UI', 10, 'bold'), width=5, anchor='e')
+        self.progress_label = tk.Label(status_row, textvariable=self.progress_pct, bg=PANEL, fg=ACCENT, font=('Segoe UI', 10, 'bold'), width=6, anchor='e')
         self.progress_label.pack(side='right', padx=(8, 0))
+
         self.progress = ttk.Progressbar(footer, maximum=1)
-        self.progress.pack(fill='x', pady=(6, 10))
+        self.progress.pack(fill='x', pady=(6, 8))
+
         actions = tk.Frame(footer, bg=PANEL)
         actions.pack(fill='x')
         self.run_button = ttk.Button(actions, text='✦  Enhance image', style='Primary.TButton', command=self.run, state='disabled')
@@ -146,31 +176,54 @@ class App:
         self.reset_button.pack(side='left')
         self.save_button = ttk.Button(actions, text='Export PNG  ↗', command=self.save, state='disabled')
         self.save_button.pack(side='right')
-        self.clock = tk.StringVar(value='Target: under 180s · actual time depends on settings')
-        tk.Label(footer, textvariable=self.clock, bg=PANEL, fg=MUTED, anchor='w').pack(fill='x', pady=(10, 0))
+
+        self.clock = tk.StringVar(value='Ready')
+        tk.Label(footer, textvariable=self.clock, bg=PANEL, fg=MUTED, anchor='w').pack(fill='x', pady=(8, 0))
+
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.poll)
 
-    def label(self, parent, text):
-        tk.Label(parent, text=text, bg=parent.cget('bg'), fg=MUTED, anchor='w').pack(fill='x', pady=(0, 4))
-
     def section(self, parent, number, title):
         row = tk.Frame(parent, bg=PANEL)
-        row.pack(fill='x', pady=(6, 12))
-        tk.Label(row, text=number, bg='#23384a', fg=ACCENT, padx=6, pady=3, font=('Segoe UI', 9, 'bold')).pack(side='left')
-        tk.Label(row, text=title, bg=PANEL, fg=FG, font=('Segoe UI', 11, 'bold')).pack(side='left', padx=8)
+        row.pack(fill='x', pady=(6, 8))
+        tk.Label(row, text=number, bg='#23384a', fg=ACCENT, padx=6, pady=2, font=('Segoe UI', 9, 'bold')).pack(side='left')
+        tk.Label(row, text=title, bg=PANEL, fg=FG, font=('Segoe UI', 10, 'bold')).pack(side='left', padx=8)
+
+    def update_expected_dims(self):
+        scale = self.output_scale.get()
+        if self.original:
+            tw = self.original.width * scale
+            th = self.original.height * scale
+            self.target_dim_label.config(text=f'Expected: {tw} × {th}')
+        else:
+            self.target_dim_label.config(text=f'Scale: {scale}×')
+
+    def set_activity_status(self, key, text, color=FG):
+        if key in self.stage_labels:
+            lbl_name, lbl_status = self.stage_labels[key]
+            lbl_status.config(text=text, fg=color)
+            if text == '✓':
+                lbl_name.config(fg=FG)
+            elif text != '—':
+                lbl_name.config(fg=ACCENT)
+
+    def reset_activity(self):
+        for key in self.stage_labels:
+            lbl_name, lbl_status = self.stage_labels[key]
+            lbl_name.config(fg=MUTED)
+            lbl_status.config(text='—', fg=MUTED)
 
     def request_cancel(self):
         if self.busy:
             self.cancel.set()
             self.cancel_button.config(state='disabled')
-            self.status.set('Cancelling… waiting for the current GPU operation to finish.')
+            self.status.set('Cancelling… waiting for current GPU step.')
 
     def reset(self):
         if self.busy:
             self.reset_pending = True
             self.request_cancel()
-            self.status.set('Reset requested. Cancelling the current job first…')
+            self.status.set('Reset requested. Cancelling job first…')
             return
         self.reset_pending = False
         self.original = self.result = None
@@ -179,23 +232,18 @@ class App:
         self.zoom = None
         self.center = [.5, .5]
         self.drag_origin = None
-        self.mode.set('Fast Detail')
-        self.preset.set('Detail · 896')
-        self.output_scale.set('2× output')
-        self.creativity.set(.25)
-        self.amount.set(1.2)
-        self.clarity.set(0.35)
-        self.limit_time.set(True)
-        self.seed.set('42')
-        self.prompt.delete('1.0', 'end')
+        self.output_scale.set(2)
         self.cancel.clear()
         self.progress['value'] = 0
         self.progress_pct.set('0%')
         self.run_button.config(state='disabled')
         self.save_button.config(state='disabled')
         self.cancel_button.config(state='disabled')
-        self.status.set('Ready for a new photograph. Settings restored; exported files are untouched.')
-        self.clock.set('Target: under 180s · actual time depends on settings')
+        self.source_dim_label.config(text='No photograph loaded')
+        self.target_dim_label.config(text='Target: —')
+        self.status.set('Ready. Settings restored.')
+        self.clock.set('Ready')
+        self.reset_activity()
         self.draw()
 
     def open_image(self):
@@ -213,7 +261,10 @@ class App:
             self.source_path = Path(path)
             self.run_button.config(state='normal')
             self.save_button.config(state='disabled')
-            self.status.set(f'{self.source_path.name} · {self.original.width} × {self.original.height}')
+            self.source_dim_label.config(text=f'Input: {self.original.width} × {self.original.height}')
+            self.update_expected_dims()
+            self.status.set(f'{self.source_path.name} loaded.')
+            self.reset_activity()
             self.draw()
         except Exception as exc:
             messagebox.showerror('Cannot open image', str(exc))
@@ -226,9 +277,7 @@ class App:
             if source is None:
                 canvas.create_text(w / 2, h / 2, text='Your image here' if canvas == self.canvases[0] else 'Enhanced preview', fill=MUTED)
             else:
-                # Display both at the same scene scale, even for a 2× export.
                 scale = self.view_scale() * self.original.width / source.width
-                # Render only the visible crop; zooming never allocates a giant bitmap.
                 cx, cy = self.center[0] * source.width, self.center[1] * source.height
                 left, top = max(0, cx - w / (2 * scale)), max(0, cy - h / (2 * scale))
                 right, bottom = min(source.width, cx + w / (2 * scale)), min(source.height, cy + h / (2 * scale))
@@ -273,14 +322,6 @@ class App:
     def run(self):
         if self.busy or self.original is None:
             return
-        try:
-            seed = int(self.seed.get())
-            if not 0 <= seed < 2**32:
-                raise ValueError()
-        except ValueError:
-            messagebox.showerror('Seed', 'Enter a whole number from 0 to 4294967295.')
-            return
-        settings = dict(mode=self.mode.get(), preset=self.preset.get(), creativity=self.creativity.get(), amount=self.amount.get(), clarity=self.clarity.get(), output_scale=int(self.output_scale.get()[0]), time_budget=170 if self.limit_time.get() else None, prompt=self.prompt.get('1.0', 'end').strip(), seed=seed)
         self.busy = True
         self.cancel.clear()
         self.started = time.perf_counter()
@@ -289,19 +330,29 @@ class App:
         self.save_button.config(state='disabled')
         self.open_button.config(state='disabled')
         self.run_button.config(state='disabled')
+        self.r2.config(state='disabled')
+        self.r4.config(state='disabled')
         self.cancel_button.config(state='normal')
-        for widget in self.inputs:
-            widget.config(state='disabled')
-        self.status.set('Starting GPU enhancement…')
+        self.status.set('Starting Extreme Micro-Detail Reconstruction…')
         self.progress['value'] = 0
         self.progress_pct.set('0%')
+        self.reset_activity()
+
+        scale = self.output_scale.get()
         source = self.original.copy()
+
         def worker():
             try:
-                result, info = self.engine.run(source, **settings, cancel=self.cancel, report=lambda text, progress: self.events.put(('progress', (text, progress))))
+                result, info = self.engine.run(
+                    source,
+                    output_scale=scale,
+                    cancel=self.cancel,
+                    report=lambda text, progress: self.events.put(('progress', (text, progress)))
+                )
                 self.events.put(('done', (result, info)))
             except Exception as exc:
                 self.events.put(('error', (str(exc), isinstance(exc, Cancelled))))
+
         threading.Thread(target=worker, daemon=True).start()
 
     def poll(self):
@@ -311,17 +362,41 @@ class App:
             except queue.Empty:
                 break
             if kind == 'progress':
+                txt, p = data
                 if not self.cancel.is_set():
-                    self.status.set(data[0])
-                self.progress['value'] = data[1]
-                self.progress_pct.set(f'{int(round(data[1] * 100))}%')
+                    self.status.set(txt)
+                self.progress['value'] = p
+                self.progress_pct.set(f'{int(round(p * 100))}%')
+
+                # Update structured activity checklist
+                if 'Analyzing' in txt:
+                    self.set_activity_status('analyze', 'Active', ACCENT)
+                elif 'Creating neural' in txt:
+                    self.set_activity_status('analyze', '✓')
+                    self.set_activity_status('sr_base', f'{int(p*100)}%', ACCENT)
+                elif 'Generating photographic' in txt:
+                    self.set_activity_status('sr_base', '✓')
+                    self.set_activity_status('gen_detail', 'Active', ACCENT)
+                elif 'Micro-detail tiles' in txt:
+                    self.set_activity_status('gen_detail', '✓')
+                    parts = txt.split('Micro-detail tiles ')[-1].split(' ·')[0]
+                    self.set_activity_status('materials', parts, ACCENT)
+                elif 'Ultra-detail' in txt:
+                    self.set_activity_status('materials', '✓')
+                    self.set_activity_status('refine', 'Active', ACCENT)
+                elif 'Artifact' in txt:
+                    self.set_activity_status('refine', '✓')
+                    self.set_activity_status('safety', 'Active', ACCENT)
+                elif 'Finalizing' in txt:
+                    self.set_activity_status('safety', '✓')
             else:
                 self.busy = False
                 self.open_button.config(state='normal')
                 self.run_button.config(state='normal')
+                self.r2.config(state='normal')
+                self.r4.config(state='normal')
                 self.cancel_button.config(state='disabled')
-                for widget in self.inputs:
-                    widget.config(state='readonly' if isinstance(widget, ttk.Combobox) else 'normal')
+
                 if self.reset_pending:
                     self.reset()
                     continue
@@ -335,20 +410,26 @@ class App:
                     self.save_button.config(state='normal')
                     self.progress['value'] = 1.0
                     self.progress_pct.set('100%')
-                    self.clock.set(f"{self.info['seconds']:.1f}s · {self.info['gpu']} · AI work size {self.info['working_size'][0]} × {self.info['working_size'][1]}")
+                    for k in self.stage_labels:
+                        self.set_activity_status(k, '✓')
+                    self.clock.set(f"{self.info['seconds']:.1f}s · {self.info['gpu']} · VRAM {self.info.get('vram_display', '')} · Output {self.info['output_size'][0]} × {self.info['output_size'][1]}")
                 else:
                     self.status.set(data[0])
                     self.clock.set(f'Stopped after {time.perf_counter() - self.started:.1f}s')
                     if not data[1]:
                         messagebox.showerror('Enhancement stopped', data[0])
         if self.busy:
-            self.clock.set(f'{time.perf_counter() - self.started:.1f}s elapsed · cancellation checked between GPU steps')
+            self.clock.set(f'{time.perf_counter() - self.started:.1f}s elapsed · GPU executing…')
         self.root.after(100, self.poll)
 
     def save(self):
         if self.result is None:
             return
-        path = filedialog.asksaveasfilename(defaultextension='.png', initialfile=self.source_path.stem + '-detail.png', filetypes=[('PNG image', '*.png')])
+        path = filedialog.asksaveasfilename(
+            defaultextension='.png',
+            initialfile=self.source_path.stem + f'-{self.output_scale.get()}x-detail.png',
+            filetypes=[('PNG image', '*.png')]
+        )
         if path:
             try:
                 from PIL.PngImagePlugin import PngInfo
